@@ -1,0 +1,1230 @@
+#!/usr/bin/env bash
+#
+# llmstack — pile LLM 100 % locale
+#   llama.cpp  : bare metal (compilé depuis les sources), écoute sur un socket unix
+#   LiteLLM    : conteneur podman rootless durci
+#   Open WebUI : conteneur podman rootless durci
+#   SearXNG    : conteneur podman rootless durci
+#   opencode   : conteneur podman rootless durci, à la demande (« llmstack code »)
+#   Réseau     : réseau podman interne (sans Internet) + réseau « front » pour les services qui en ont besoin
+#
+# Respecte XDG :
+#   config  $XDG_CONFIG_HOME/llmstack   (stack.env, secrets.env, models.d/, litellm.d/, searxng/)
+#   données $XDG_DATA_HOME/llmstack     (bin/, venvs/, llama.cpp/, models/, webui/)
+#   état    $XDG_STATE_HOME/llmstack    (run/*.pid, log/*.log)
+#   cache   $XDG_CACHE_HOME/llmstack
+#
+set -Eeuo pipefail
+shopt -s nullglob
+
+PROG=${0##*/}
+VERSION=2.0.0
+
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+  echo "$PROG: bash >= 4.4 requis (macOS : brew install bash)" >&2
+  exit 1
+fi
+
+# ───────────────────────────── Affichage ─────────────────────────────
+if [[ -t 1 ]]; then
+  C_B=$'\e[1;34m' C_G=$'\e[32m' C_Y=$'\e[33m' C_R=$'\e[31m' C_0=$'\e[0m'
+else
+  C_B= C_G= C_Y= C_R= C_0=
+fi
+info() { printf '%s==>%s %s\n' "$C_B" "$C_0" "$*"; }
+ok()   { printf '%s ✓%s %s\n' "$C_G" "$C_0" "$*"; }
+warn() { printf '%s !%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
+die()  { printf '%serreur :%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
+need() { local c; for c in "$@"; do command -v "$c" >/dev/null 2>&1 || die "commande requise introuvable : $c"; done; }
+
+ASSUME_YES=0
+confirm() {
+  if (( ASSUME_YES )); then return 0; fi
+  [[ -t 0 ]] || die "confirmation requise : relance avec -y"
+  local a; read -r -p "$1 [o/N] " a
+  [[ $a =~ ^[oOyY] ]]
+}
+
+safe_rm() {
+  local p
+  for p in "$@"; do
+    [[ -n $p && $p != / && $p != "$HOME" && $p == /*/* ]] || die "refus de supprimer '$p'"
+    rm -rf -- "$p"
+  done
+}
+
+rand_hex() { head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+
+# ───────────────────────────── Configuration ─────────────────────────────
+SERVICES=(searxng llama litellm webui)
+
+load_config() {
+  local xc=${XDG_CONFIG_HOME:-$HOME/.config} xd=${XDG_DATA_HOME:-$HOME/.local/share}
+  local xs=${XDG_STATE_HOME:-$HOME/.local/state} xk=${XDG_CACHE_HOME:-$HOME/.cache}
+  CONF_DIR=$xc/llmstack DATA_DIR=$xd/llmstack STATE_DIR=$xs/llmstack CACHE_DIR=$xk/llmstack
+  PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
+
+  # Défauts (surchargeables par l'environnement ou par stack.env)
+  : "${BIND_HOST:=127.0.0.1}"          # exposition de LiteLLM et Open WebUI
+  : "${WEBUI_PORT:=8080}"
+  : "${LITELLM_PORT:=4000}"
+  : "${SEARXNG_PORT:=8888}"
+  : "${LLAMA_BASE_PORT:=8081}"
+  : "${ENABLE_SEARXNG:=1}"
+  : "${LLAMA_REPO:=https://github.com/ggml-org/llama.cpp}"
+  : "${LLAMA_REF:=master}"             # branche ou tag (ex: b6000)
+  : "${LLAMA_BACKEND:=auto}"           # auto|cuda|hip|vulkan|metal|cpu
+  : "${LLAMA_CMAKE_ARGS:=}"            # ex: -DAMDGPU_TARGETS=gfx1100
+  # Images : épingle des versions/digests dans stack.env (les défauts sont flottants)
+  : "${LITELLM_IMAGE:=ghcr.io/berriai/litellm:main-stable}"
+  : "${WEBUI_IMAGE:=ghcr.io/open-webui/open-webui:main}"
+  : "${SEARXNG_IMAGE:=docker.io/searxng/searxng:latest}"
+  : "${RELAY_IMAGE:=docker.io/alpine/socat:latest}"
+  : "${SEARXNG_CONTAINER:=llmstack-searxng}"
+  CT_LITELLM=llmstack-litellm CT_WEBUI=llmstack-webui CT_RELAY=llmstack-relay
+  : "${NET_BACK:=llmstack-back}"       # réseau interne (--internal) : aucun accès Internet
+  : "${NET_FRONT:=llmstack-front}"     # réseau avec sortie : Open WebUI, SearXNG, LiteLLM (si publié)
+  # Utilisateurs (uid dans le conteneur) — sans entrée passwd côté hôte
+  : "${SERVICE_UID:=60001}"            # LiteLLM, Open WebUI, relais : mappé sur un subuid
+  : "${SEARXNG_USERNS:=keep-id:uid=977,gid=977}"   # inchangé : l'image SearXNG change d'utilisateur à l'entrée
+  : "${CODE_UID:=60000}"               # opencode
+  : "${CODE_USERNS:=keep-id}"          # keep-id | isolated
+  : "${CODE_NET:=0}"                   # 1 : opencode a aussi accès à Internet
+  # Sandbox opencode
+  : "${CODE_IMAGE:=localhost/llmstack-opencode:latest}"
+  : "${CODE_BASE_IMAGE:=docker.io/library/node:22-bookworm-slim}"
+  : "${OPENCODE_VERSION:=latest}"
+  : "${CODE_APT_PKGS:=}"               # paquets apt en plus dans l'image (ex: "python3 build-essential")
+  : "${CODE_API_KEY:=}"                # clé LiteLLM dédiée (sinon : master key)
+  # Durcissement
+  : "${LITELLM_PUBLISH:=1}"            # 0 : API LiteLLM non publiée sur l'hôte
+  : "${WEBUI_ENABLE_SIGNUP:=True}"     # passer à False une fois le compte admin créé
+  : "${TMP_SIZE:=1g}"
+  : "${LITELLM_MEMORY:=2g}" "${WEBUI_MEMORY:=4g}" "${SEARXNG_MEMORY:=1g}" "${RELAY_MEMORY:=128m}" "${CODE_MEMORY:=8g}"
+  : "${LITELLM_PIDS:=512}" "${WEBUI_PIDS:=1024}" "${SEARXNG_PIDS:=256}" "${CODE_PIDS:=1024}"
+  : "${LITELLM_PODMAN_ARGS:=}" "${WEBUI_PODMAN_ARGS:=}" "${SEARXNG_PODMAN_ARGS:=}" "${RELAY_PODMAN_ARGS:=}" "${CODE_PODMAN_ARGS:=}"
+  : "${DEFAULT_CTX:=8192}"
+  : "${DEFAULT_QUANT:=Q4_K_M}"
+  : "${HF_ENDPOINT:=https://huggingface.co}"
+
+  if [[ -f $CONF_DIR/stack.env ]]; then
+    # shellcheck disable=SC1091
+    source "$CONF_DIR/stack.env"
+  fi
+
+  : "${MODELS_DIR:=$DATA_DIR/models}"
+  BIN_DIR=$DATA_DIR/bin VENV_DIR=$DATA_DIR/venvs SRC_DIR=$DATA_DIR/llama.cpp
+  RUN_DIR=$STATE_DIR/run LOG_DIR=$STATE_DIR/log MODELS_CONF=$CONF_DIR/models.d
+  # Sockets des llama-server : dossier 711 (traversable), sockets en 666 → visibles seulement via le montage du relais
+  SOCK_DIR=${XDG_RUNTIME_DIR:-$STATE_DIR}/llmstack
+  LITELLM_RT=$STATE_DIR/litellm
+  CODE_HOME=$DATA_DIR/opencode-home CODE_HOME_ISO=$DATA_DIR/opencode-home-isolated
+}
+
+load_secrets() {
+  local f=$CONF_DIR/secrets.env
+  if [[ ! -f $f ]]; then
+    mkdir -p "$CONF_DIR"
+    ( umask 077
+      {
+        echo "LITELLM_MASTER_KEY=sk-$(rand_hex 24)"
+        echo "WEBUI_SECRET_KEY=$(rand_hex 32)"
+        echo "SEARXNG_SECRET=$(rand_hex 32)"
+      } >"$f" )
+  fi
+  # shellcheck disable=SC1090
+  source "$f"
+}
+
+ensure_dirs() {
+  mkdir -p "$CONF_DIR" "$MODELS_CONF" "$CONF_DIR/litellm.d" "$CONF_DIR/searxng" \
+           "$DATA_DIR" "$BIN_DIR" "$MODELS_DIR" \
+           "$RUN_DIR" "$LOG_DIR" "$CACHE_DIR" "$LITELLM_RT" "$STATE_DIR/code" "$CODE_HOME" "$SOCK_DIR"
+  chmod 711 "$SOCK_DIR"
+}
+
+load_all() { load_config; load_secrets; ensure_dirs; }
+
+set_conf() { # KEY VALUE → persiste dans stack.env
+  local k=$1 v=$2 f=$CONF_DIR/stack.env
+  touch "$f"
+  if grep -q "^$k=" "$f"; then
+    sed -E -i.bak "s|^$k=.*|$k=$v|" "$f" && rm -f "$f.bak"
+  else
+    echo "$k=$v" >>"$f"
+  fi
+}
+
+svc_enabled() { [[ $1 != searxng || $ENABLE_SEARXNG == 1 ]]; }
+
+# ───────────────────────────── Processus bare metal ─────────────────────────────
+pid_of() { # id → pid si actif
+  local pf=$RUN_DIR/$1.pid p
+  if [[ -f $pf ]]; then
+    p=$(<"$pf")
+    if kill -0 "$p" 2>/dev/null; then echo "$p"; fi
+  fi
+}
+is_running() { [[ -n $(pid_of "$1") ]]; }
+
+spawn() { # id workdir [VAR=val ...] cmd args...
+  local id=$1 wd=$2 log=$LOG_DIR/$1.log; shift 2
+  if is_running "$id"; then ok "$id déjà actif (pid $(pid_of "$id"))"; return 0; fi
+  mkdir -p "$wd" "$RUN_DIR" "$LOG_DIR"
+  if [[ -n $(find "$log" -size +10M 2>/dev/null) ]]; then mv -f "$log" "$log.1"; fi
+  local ss=()
+  if command -v setsid >/dev/null 2>&1; then ss=(setsid); fi
+  ( cd "$wd" && exec "${ss[@]}" nohup env "$@" ) >>"$log" 2>&1 </dev/null &
+  echo $! >"$RUN_DIR/$id.pid"
+  sleep 1
+  is_running "$id" || die "$id s'est arrêté immédiatement — voir : $PROG logs $id"
+}
+
+stop_proc() {
+  local id=$1 pid i
+  pid=$(pid_of "$id")
+  if [[ -n $pid ]]; then
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    for i in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    fi
+    ok "$id arrêté"
+  fi
+  rm -f "$RUN_DIR/$id.pid"
+}
+
+wait_http() { # url timeout label
+  local url=$1 t=$2 label=$3 i
+  for (( i = 0; i < t; i++ )); do
+    if curl -fsS -o /dev/null --max-time 2 "$url" 2>/dev/null; then ok "$label prêt"; return 0; fi
+    sleep 1
+  done
+  warn "$label ne répond pas encore sur $url (voir : $PROG logs ...)"
+  return 0
+}
+
+# ───────────────────────────── Modèles ─────────────────────────────
+model_names() { local f; for f in "$MODELS_CONF"/*.env; do f=${f##*/}; echo "${f%.env}"; done; }
+
+load_model() {
+  REPO='' FILE='' PORT='' CTX=$DEFAULT_CTX NGL='' ENABLED=1 EXTRA=''
+  # shellcheck disable=SC1090
+  source "$MODELS_CONF/$1.env"
+}
+
+default_ngl() {
+  local b=cpu
+  [[ -f $DATA_DIR/backend ]] && b=$(<"$DATA_DIR/backend")
+  if [[ $b == cpu ]]; then echo 0; else echo 99; fi
+}
+
+curl_hf() {
+  local a=()
+  if [[ -n ${HF_TOKEN:-} ]]; then a=(-H "Authorization: Bearer $HF_TOKEN"); fi
+  curl "${a[@]}" "$@"
+}
+
+list_ggufs() { # repo → fichiers .gguf (hors mmproj)
+  local json
+  json=$(curl_hf -fsSL "$HF_ENDPOINT/api/models/$1") || die "dépôt HF introuvable ou privé (HF_TOKEN ?) : $1"
+  { grep -oE '"rfilename" *: *"[^"]+\.gguf"' <<<"$json" || true; } \
+    | sed -E 's/^"rfilename" *: *"(.*)"$/\1/' | { grep -vi mmproj || true; } | sort
+}
+
+RESOLVED=()
+resolve_files() { # repo selector → RESOLVED[] (parts d'un GGUF éventuellement splitté)
+  local repo=$1 sel=$2 all=() f bases
+  mapfile -t all < <(list_ggufs "$repo")
+  (( ${#all[@]} )) || die "aucun fichier GGUF dans $repo"
+  RESOLVED=()
+  for f in "${all[@]}"; do [[ $f == "$sel" ]] && RESOLVED+=("$f"); done
+  if (( ${#RESOLVED[@]} == 0 )); then
+    for f in "${all[@]}"; do [[ ${f,,} == *"${sel,,}"* ]] && RESOLVED+=("$f"); done
+  fi
+  if (( ${#RESOLVED[@]} == 0 )); then
+    warn "aucun fichier ne correspond à '$sel'. Disponibles :"
+    printf '   %s\n' "${all[@]}" >&2
+    exit 1
+  fi
+  bases=$(printf '%s\n' "${RESOLVED[@]}" | sed -E 's/-[0-9]{5}-of-[0-9]{5}\.gguf$/.gguf/' | sort -u | wc -l)
+  if (( bases > 1 )); then
+    warn "'$sel' est ambigu, précise le fichier ou la quantisation :"
+    printf '   %s\n' "${RESOLVED[@]}" >&2
+    exit 1
+  fi
+}
+
+download() { # url dest
+  local url=$1 dest=$2 bar=(-s -S)
+  [[ -f $dest ]] && { ok "déjà présent : ${dest##*/}"; return 0; }
+  mkdir -p "${dest%/*}"
+  if [[ -t 2 ]]; then bar=(--progress-bar); fi
+  info "Téléchargement ${dest##*/}"
+  curl_hf -fL -C - --retry 3 "${bar[@]}" -o "$dest.part" "$url"
+  mv "$dest.part" "$dest"
+}
+
+next_port() {
+  local max=$(( LLAMA_BASE_PORT - 1 )) f p
+  for f in "$MODELS_CONF"/*.env; do
+    p=$( . "$f"; echo "${PORT:-0}" )
+    (( p > max )) && max=$p
+  done
+  echo $(( max + 1 ))
+}
+
+write_model_conf() { # name repo file port ctx ngl enabled extra
+  {
+    printf 'REPO=%q\n' "$2"; printf 'FILE=%q\n' "$3"; printf 'PORT=%q\n' "$4"
+    printf 'CTX=%q\n' "$5";  printf 'NGL=%q\n' "$6";  printf 'ENABLED=%q\n' "$7"
+    printf 'EXTRA=%q\n' "$8"
+  } >"$MODELS_CONF/$1.env"
+}
+
+model_setup() {
+  local pos=() ctx=$DEFAULT_CTX ngl='' extra='' enable=1 port=''
+  while (( $# )); do
+    case $1 in
+      --ctx)   ctx=${2:?valeur manquante}; shift 2;;
+      --ngl)   ngl=${2:?valeur manquante}; shift 2;;
+      --extra) extra=${2:?valeur manquante}; shift 2;;
+      --port)  port=${2:?valeur manquante}; shift 2;;
+      --no-enable) enable=0; shift;;
+      -*) die "option inconnue : $1";;
+      *)  pos+=("$1"); shift;;
+    esac
+  done
+  (( ${#pos[@]} >= 2 )) || die "usage : $PROG model setup <nom> <user/repo[:quant] | fichier.gguf> [quant|fichier] [--ctx N] [--ngl N] [--extra \"args llama-server\"] [--port N] [--no-enable]"
+  local name=${pos[0]} repo=${pos[1]} sel=${pos[2]:-} file rec
+  [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "nom invalide (caractères permis : A-Z a-z 0-9 . _ -)"
+  [[ -f $MODELS_CONF/$name.env ]] && die "'$name' existe déjà (voir : $PROG model remove $name)"
+  [[ -n $port ]] || port=$(next_port)
+
+  if [[ -f $repo ]]; then
+    local src; src=$(realpath "$repo")
+    file=${src##*/}
+    mkdir -p "$MODELS_DIR/$name"
+    ln -sfn "$src" "$MODELS_DIR/$name/$file"
+    rec="local:$src"
+  else
+    need curl
+    repo=${repo#https://huggingface.co/}; repo=${repo#hf.co/}
+    if [[ -z $sel && $repo == *:* ]]; then sel=${repo##*:}; repo=${repo%%:*}; fi
+    [[ -n $sel ]] || sel=$DEFAULT_QUANT
+    info "Recherche de '$sel' dans $repo"
+    resolve_files "$repo" "$sel"
+    local f
+    for f in "${RESOLVED[@]}"; do
+      download "$HF_ENDPOINT/$repo/resolve/main/$f?download=true" "$MODELS_DIR/$name/$f"
+    done
+    file=${RESOLVED[0]}
+    rec=$repo
+  fi
+  write_model_conf "$name" "$rec" "$file" "$port" "$ctx" "$ngl" "$enable" "$extra"
+  ok "modèle '$name' configuré (port $port, ctx $ctx) → $MODELS_CONF/$name.env"
+  info "Applique avec : $PROG restart llama litellm"
+}
+
+model_list() {
+  local n fmt='%-20s %-6s %-7s %-8s %-7s %-8s %s\n'
+  printf "$fmt" NOM PORT CTX TAILLE ACTIVÉ ÉTAT SOURCE
+  for n in $(model_names); do
+    load_model "$n"
+    local size=- st=stoppé
+    if [[ -e $MODELS_DIR/$n/$FILE ]]; then size=$(du -shL "$MODELS_DIR/$n" 2>/dev/null | cut -f1); else size=ABSENT; fi
+    if is_running "llama-$n"; then st=actif; fi
+    printf "$fmt" "$n" "$PORT" "$CTX" "$size" "$([[ $ENABLED == 1 ]] && echo oui || echo non)" "$st" "$REPO"
+  done
+  if [[ -z $(model_names) ]]; then
+    echo "(aucun modèle — ex : $PROG model setup qwen3-8b unsloth/Qwen3-8B-GGUF Q4_K_M)"
+  fi
+}
+
+model_files() {
+  local repo=${1:?usage : $PROG model files <user/repo>}
+  repo=${repo#https://huggingface.co/}; repo=${repo#hf.co/}
+  need curl
+  list_ggufs "$repo"
+}
+
+model_toggle() { # enable|disable name
+  local v=1 f
+  [[ $1 == disable ]] && v=0
+  f=$MODELS_CONF/${2:?nom de modèle requis}.env
+  [[ -f $f ]] || die "modèle inconnu : $2"
+  sed -E "s/^ENABLED=.*/ENABLED=$v/" "$f" >"$f.tmp" && mv "$f.tmp" "$f"
+  ok "$2 : $1"
+  info "Applique avec : $PROG restart llama litellm"
+}
+
+model_remove() {
+  local n=${1:?nom de modèle requis}
+  [[ -f $MODELS_CONF/$n.env ]] || die "modèle inconnu : $n"
+  confirm "Supprimer le modèle '$n' et ses fichiers ?" || return 0
+  stop_proc "llama-$n"
+  rm -f "$MODELS_CONF/$n.env"
+  safe_rm "$MODELS_DIR/$n"
+  ok "modèle '$n' supprimé"
+}
+
+cmd_model() {
+  load_all
+  local sub=${1:-list}; shift || true
+  case $sub in
+    setup|add)      model_setup "$@";;
+    list|ls)        model_list;;
+    files)          model_files "$@";;
+    enable|disable) model_toggle "$sub" "${1:-}";;
+    remove|rm)      model_remove "${1:-}";;
+    *) die "sous-commande inconnue : model $sub (setup|list|files|enable|disable|remove)";;
+  esac
+}
+
+# ───────────────────────────── llama.cpp (bare metal) ─────────────────────────────
+detect_backend() {
+  if [[ $LLAMA_BACKEND != auto ]]; then echo "$LLAMA_BACKEND"; return; fi
+  if [[ $(uname -s) == Darwin ]]; then echo metal
+  elif command -v nvcc >/dev/null 2>&1 || [[ -x /usr/local/cuda/bin/nvcc ]]; then echo cuda
+  elif command -v hipcc >/dev/null 2>&1 || [[ -d /opt/rocm ]]; then echo hip
+  elif command -v glslc >/dev/null 2>&1 && [[ -n $(ldconfig -p 2>/dev/null | grep libvulkan || true) ]]; then echo vulkan
+  else
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      warn "GPU NVIDIA détecté mais nvcc absent : build CPU. Installe le CUDA toolkit puis : $PROG install --backend cuda"
+    fi
+    echo cpu
+  fi
+}
+
+fetch_llama() {
+  need git
+  if [[ -d $SRC_DIR/.git ]]; then
+    git -C "$SRC_DIR" fetch --depth 1 origin "$LLAMA_REF"
+    git -C "$SRC_DIR" reset --hard FETCH_HEAD
+  else
+    git clone --depth 1 --branch "$LLAMA_REF" "$LLAMA_REPO" "$SRC_DIR"
+  fi
+}
+
+build_llama() {
+  local backend jobs args
+  backend=$(detect_backend)
+  info "Compilation de llama.cpp (backend : $backend)"
+  args=(-DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF)
+  case $backend in
+    cuda)   args+=(-DGGML_CUDA=ON); [[ -d /usr/local/cuda/bin ]] && PATH="/usr/local/cuda/bin:$PATH";;
+    hip)    args+=(-DGGML_HIP=ON);;
+    vulkan) args+=(-DGGML_VULKAN=ON);;
+    metal)  args+=(-DGGML_METAL=ON);;
+    cpu)    ;;
+    *) die "backend inconnu : $backend";;
+  esac
+  # shellcheck disable=SC2206
+  args+=($LLAMA_CMAKE_ARGS)
+  jobs=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+  cmake -S "$SRC_DIR" -B "$SRC_DIR/build" "${args[@]}"
+  cmake --build "$SRC_DIR/build" --config Release --target llama-server -j "$jobs"
+  install -Dm755 "$SRC_DIR/build/bin/llama-server" "$BIN_DIR/llama-server"
+  echo "$backend" >"$DATA_DIR/backend"
+  git -C "$SRC_DIR" rev-parse --short HEAD >"$DATA_DIR/llama.rev"
+  ok "llama-server installé ($(<"$DATA_DIR/llama.rev"), $backend)"
+}
+
+update_llama() {
+  local before after
+  before=$(cat "$DATA_DIR/llama.rev" 2>/dev/null || true)
+  fetch_llama
+  after=$(git -C "$SRC_DIR" rev-parse --short HEAD)
+  if [[ $before == "$after" && -x $BIN_DIR/llama-server ]]; then
+    ok "llama.cpp déjà à jour ($after)"
+  else
+    build_llama
+  fi
+}
+
+# ───────────────────────────── Conteneurs (podman rootless durci) ─────────────────────────────
+# Tous les conteneurs : --cap-drop=ALL, no-new-privileges, rootfs en lecture seule, /tmp en tmpfs,
+# limites mémoire/pids, réseau interne (--internal) sans accès Internet sauf si le service en a besoin.
+need_podman() {
+  need podman
+  [[ $(id -u) -ne 0 ]] || die "podman doit tourner en rootless : ne lance pas ce script en root"
+}
+
+ctr_pid() { podman container inspect -f '{{if .State.Running}}{{.State.Pid}}{{end}}' "$1" 2>/dev/null || true; }
+ctr_running() { [[ -n $(ctr_pid "$1") ]]; }
+
+stop_ctr() {
+  local n=$1
+  command -v podman >/dev/null 2>&1 || return 0
+  if ctr_running "$n"; then
+    podman stop -t 15 "$n" >/dev/null 2>&1 || true
+    ok "$n arrêté"
+  fi
+  podman rm -f "$n" >/dev/null 2>&1 || true
+}
+
+ensure_networks() {
+  need_podman
+  podman network exists "$NET_BACK" 2>/dev/null || podman network create --internal "$NET_BACK" >/dev/null
+  podman network exists "$NET_FRONT" 2>/dev/null || podman network create "$NET_FRONT" >/dev/null
+}
+
+# Fichier d'environnement éphémère (0600, tmpfs) : les secrets ne passent jamais en argument de commande
+ENVF=''
+cleanup_envfile() { if [[ -n $ENVF ]]; then rm -f -- "$ENVF"; fi; ENVF=''; }
+trap cleanup_envfile EXIT
+mk_envfile() { # KEY=VAL...
+  cleanup_envfile
+  ENVF=$(mktemp "${XDG_RUNTIME_DIR:-$RUN_DIR}/llmstack-env.XXXXXX")
+  printf '%s\n' "$@" >"$ENVF"
+}
+
+# Propriétaire d'un dossier dans le user namespace rootless (uid conteneur → subuid côté hôte)
+own_dir() { # dir uid gid
+  local d=$1 u=$2 g=$3 cur
+  mkdir -p "$d"
+  cur=$(podman unshare stat -c '%u:%g' "$d" 2>/dev/null || true)
+  if [[ $cur != "$u:$g" ]]; then
+    info "droits de $d → uid $u (podman unshare chown)"
+    podman unshare chown -R "$u:$g" "$d" || die "podman unshare a échoué — /etc/subuid et /etc/subgid sont-ils configurés pour $USER ?"
+  fi
+}
+
+HARDEN=()
+harden() { # mémoire pids → HARDEN[]
+  HARDEN=(--cap-drop=ALL --security-opt=no-new-privileges --read-only
+          --tmpfs "/tmp:rw,nosuid,nodev,size=$TMP_SIZE" --pids-limit "$2")
+  if [[ -n $1 ]]; then HARDEN+=(--memory "$1"); fi
+}
+
+warn_unpinned() { # image
+  local tag=${1##*/}
+  [[ $1 != *@sha256:* ]] || return 0
+  if [[ $tag != *:* ]] || [[ ${tag##*:} =~ ^(latest|main|main-stable|stable|master)$ ]]; then
+    warn "image non épinglée : $1 (fixe une version ou un digest dans stack.env)"
+  fi
+}
+
+pull_image() { warn_unpinned "$1"; info "Récupération de $1"; podman pull "$1" >/dev/null; ok "$1"; }
+
+setup_searxng_conf() {
+  mkdir -p "$CONF_DIR/searxng" "$DATA_DIR/searxng-cache"
+  if [[ ! -f $CONF_DIR/searxng/settings.yml ]]; then
+    cat >"$CONF_DIR/searxng/settings.yml" <<EOF
+# Généré par $PROG — éditable
+use_default_settings: true
+general:
+  instance_name: "llmstack"
+  enable_metrics: false
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json
+server:
+  secret_key: "$SEARXNG_SECRET"
+  limiter: false
+  image_proxy: true
+EOF
+  fi
+}
+
+setup_images() { # relay|litellm|webui|searxng ...
+  need_podman; ensure_networks
+  local c
+  for c in "$@"; do
+    case $c in
+      relay)   pull_image "$RELAY_IMAGE";;
+      litellm) pull_image "$LITELLM_IMAGE";;
+      webui)   pull_image "$WEBUI_IMAGE";;
+      searxng) if svc_enabled searxng; then setup_searxng_conf; pull_image "$SEARXNG_IMAGE"; fi;;
+    esac
+  done
+}
+
+write_stack_env() {
+  local f=$CONF_DIR/stack.env
+  [[ -f $f ]] && return 0
+  cat >"$f" <<EOF
+# llmstack — surcharges (décommenter pour modifier)
+#BIND_HOST=$BIND_HOST
+#WEBUI_PORT=$WEBUI_PORT
+#LITELLM_PORT=$LITELLM_PORT
+#SEARXNG_PORT=$SEARXNG_PORT
+#LLAMA_BASE_PORT=$LLAMA_BASE_PORT
+#LLAMA_REF=$LLAMA_REF
+#LLAMA_BACKEND=$LLAMA_BACKEND
+#LLAMA_CMAKE_ARGS=""
+#MODELS_DIR=$MODELS_DIR
+#DEFAULT_CTX=$DEFAULT_CTX
+#DEFAULT_QUANT=$DEFAULT_QUANT
+
+# ── Images : épingle des versions (ou des digests @sha256:...) puis : $PROG update
+#LITELLM_IMAGE=$LITELLM_IMAGE
+#WEBUI_IMAGE=$WEBUI_IMAGE
+#SEARXNG_IMAGE=$SEARXNG_IMAGE
+#RELAY_IMAGE=$RELAY_IMAGE
+#OPENCODE_VERSION=$OPENCODE_VERSION
+#CODE_BASE_IMAGE=$CODE_BASE_IMAGE
+#CODE_APT_PKGS=""
+
+# ── Sécurité des conteneurs
+#SERVICE_UID=$SERVICE_UID          # uid (conteneur) de LiteLLM/Open WebUI/relais → subuid côté hôte
+#SEARXNG_USERNS=$SEARXNG_USERNS
+#CODE_UID=$CODE_UID                # uid d'opencode dans le sandbox
+#CODE_USERNS=$CODE_USERNS          # keep-id | isolated
+#CODE_NET=$CODE_NET                # 1 = opencode a accès à Internet
+#LITELLM_PUBLISH=$LITELLM_PUBLISH  # 0 = API LiteLLM non publiée sur l'hôte
+#WEBUI_ENABLE_SIGNUP=$WEBUI_ENABLE_SIGNUP   # False une fois le compte admin créé
+#WEBUI_MEMORY=$WEBUI_MEMORY
+#LITELLM_MEMORY=$LITELLM_MEMORY
+#CODE_MEMORY=$CODE_MEMORY
+# Arguments podman supplémentaires par service (ex: "--read-only=false" pour lever un durcissement qui bloque) :
+#WEBUI_PODMAN_ARGS=""
+#LITELLM_PODMAN_ARGS=""
+#SEARXNG_PODMAN_ARGS=""
+#CODE_PODMAN_ARGS=""
+EOF
+}
+
+cmd_install() {
+  load_config
+  while (( $# )); do
+    case $1 in
+      --backend)    LLAMA_BACKEND=${2:?valeur manquante}; shift 2;;
+      --ref)        LLAMA_REF=${2:?valeur manquante}; shift 2;;
+      --no-searxng) ENABLE_SEARXNG=0; shift;;
+      *) die "option inconnue : $1";;
+    esac
+  done
+  [[ $(id -u) -ne 0 ]] || die "ne lance pas ce script en root (tout est installé dans ton \$HOME)"
+  load_secrets; ensure_dirs; write_stack_env
+  [[ $LLAMA_BACKEND != auto ]] && set_conf LLAMA_BACKEND "$LLAMA_BACKEND"
+  [[ $LLAMA_REF != master ]] && set_conf LLAMA_REF "$LLAMA_REF"
+  set_conf ENABLE_SEARXNG "$ENABLE_SEARXNG"
+
+  need curl git cmake podman
+  command -v c++ >/dev/null 2>&1 || command -v g++ >/dev/null 2>&1 || command -v clang++ >/dev/null 2>&1 \
+    || die "compilateur C++ requis (build-essential / xcode-select --install)"
+
+  info "llama.cpp";   fetch_llama; build_llama
+  info "Images conteneurs (relais, LiteLLM, Open WebUI, SearXNG)"
+  setup_images relay litellm webui searxng
+
+  echo
+  ok "Installation terminée."
+  cat <<EOF
+
+  Étapes suivantes :
+    $PROG model setup qwen3-8b unsloth/Qwen3-8B-GGUF Q4_K_M
+    $PROG start
+    → Open WebUI : http://$BIND_HOST:$WEBUI_PORT (le premier compte créé est administrateur)
+    $PROG code            # opencode dans un sandbox, sur le dossier courant
+
+  Config : $CONF_DIR
+  Clés   : $CONF_DIR/secrets.env
+EOF
+}
+
+cmd_update() {
+  load_all
+  local comps=("$@") was=0
+  (( ${#comps[@]} )) || comps=(llama litellm webui searxng relay)
+  want() { [[ " ${comps[*]} " == *" $1 "* ]]; }
+  any_running && was=1
+  if (( was )); then stop_services; fi
+  if want llama;   then info "llama.cpp"; update_llama; fi
+  if want relay;   then setup_images relay; fi
+  if want litellm; then setup_images litellm; fi
+  if want webui;   then setup_images webui; fi
+  if want searxng && [[ $ENABLE_SEARXNG == 1 ]]; then setup_images searxng; fi
+  if want code; then info "opencode (image sandbox)"; code_build fresh; fi
+  if (( was )); then
+    info "Redémarrage de la stack"
+    start_services
+  fi
+  ok "Mise à jour terminée"
+}
+
+safe_rm_ns() { # supprime des chemins éventuellement possédés par un subuid
+  local p
+  for p in "$@"; do
+    [[ -n $p && $p != / && $p != "$HOME" && $p == /*/* ]] || die "refus de supprimer '$p'"
+    if command -v podman >/dev/null 2>&1; then podman unshare rm -rf -- "$p" || rm -rf -- "$p"; else rm -rf -- "$p"; fi
+  done
+}
+
+cmd_uninstall() {
+  load_all
+  local purge=0 c
+  [[ ${1:-} == --purge ]] && purge=1
+  if (( purge )); then
+    confirm "Désinstaller TOUT (logiciels, images, modèles, données Open WebUI, config) ?" || { info "annulé"; return 0; }
+  else
+    confirm "Désinstaller les logiciels (modèles, données Open WebUI et config conservés) ?" || { info "annulé"; return 0; }
+  fi
+  stop_services
+  if command -v podman >/dev/null 2>&1; then
+    for c in "$SEARXNG_CONTAINER" "$CT_LITELLM" "$CT_WEBUI" "$CT_RELAY"; do podman rm -f "$c" >/dev/null 2>&1 || true; done
+    for c in "$SEARXNG_IMAGE" "$LITELLM_IMAGE" "$WEBUI_IMAGE" "$RELAY_IMAGE" "$CODE_IMAGE"; do
+      podman rmi "$c" >/dev/null 2>&1 || true
+    done
+    podman network rm "$NET_BACK" "$NET_FRONT" >/dev/null 2>&1 || true
+  fi
+  safe_rm "$BIN_DIR" "$VENV_DIR" "$SRC_DIR" "$STATE_DIR" "$CACHE_DIR"
+  rm -f "$DATA_DIR/backend" "$DATA_DIR/llama.rev"
+  if (( purge )); then
+    safe_rm_ns "$MODELS_DIR" "$DATA_DIR"
+    safe_rm "$CONF_DIR"
+  fi
+  ok "llmstack désinstallé$( (( purge )) || echo ' (données conservées : '"$DATA_DIR"' et '"$CONF_DIR"')')"
+}
+
+# ───────────────────────────── Services ─────────────────────────────
+wait_sock() { # socket timeout label — rend aussi le socket accessible au relais (uid de conteneur ≠ le tien)
+  local s=$1 t=$2 label=$3 i
+  for (( i = 0; i < t; i++ )); do
+    if [[ -S $s ]]; then chmod 666 "$s"; fi
+    if [[ -S $s ]] && curl -fsS -o /dev/null --max-time 2 --unix-socket "$s" http://localhost/health 2>/dev/null; then
+      ok "$label prêt"; return 0
+    fi
+    sleep 1
+  done
+  warn "$label ne répond pas encore sur $s (voir : $PROG logs ...)"
+  return 0
+}
+
+ctr_http_ok() { # conteneur url — requête exécutée DANS le conteneur
+  podman exec "$1" python3 -c 'import sys,urllib.request; urllib.request.urlopen(sys.argv[1], timeout=2)' "$2" >/dev/null 2>&1
+}
+
+wait_ctr() { # conteneur timeout label url
+  local c=$1 t=$2 label=$3 url=$4 i
+  for (( i = 0; i < t; i++ )); do
+    if ! ctr_running "$c"; then warn "$label s'est arrêté — voir : $PROG logs ${c#llmstack-}"; return 0; fi
+    if ctr_http_ok "$c" "$url"; then ok "$label prêt"; return 0; fi
+    sleep 1
+  done
+  warn "$label ne répond pas encore (voir : $PROG logs ${c#llmstack-})"
+  return 0
+}
+
+split_args() { # chaîne → SPLIT[]
+  SPLIT=()
+  if [[ -n $1 ]]; then read -r -a SPLIT <<<"$1"; fi
+}
+
+start_searxng() {
+  svc_enabled searxng || return 0
+  need_podman; ensure_networks
+  if ctr_running "$SEARXNG_CONTAINER"; then ok "searxng déjà actif"; return 0; fi
+  setup_searxng_conf
+  harden "$SEARXNG_MEMORY" "$SEARXNG_PIDS"
+  split_args "$SEARXNG_PODMAN_ARGS"
+  info "Démarrage de SearXNG"
+  podman run -d --replace --name "$SEARXNG_CONTAINER" \
+    --userns="$SEARXNG_USERNS" \
+    --network "$NET_BACK" --network "$NET_FRONT" \
+    -p "127.0.0.1:$SEARXNG_PORT:8080" \
+    -v "$CONF_DIR/searxng:/etc/searxng:Z" \
+    -v "$DATA_DIR/searxng-cache:/var/cache/searxng:Z" \
+    "${HARDEN[@]}" \
+    --cap-add=CHOWN --cap-add=SETGID --cap-add=SETUID --cap-add=DAC_OVERRIDE \
+    "${SPLIT[@]}" "$SEARXNG_IMAGE" >/dev/null
+  wait_ctr "$SEARXNG_CONTAINER" 60 searxng "http://127.0.0.1:8080/healthz"
+}
+stop_searxng() { stop_ctr "$SEARXNG_CONTAINER"; }
+
+# llama-server (bare metal) n'écoute QUE sur un socket unix ; ce relais (socat, réseau interne)
+# est le seul pont entre le réseau interne et l'hôte : il ne transfère que les modèles activés.
+start_relay() {
+  need_podman; ensure_networks
+  local n cmd='' any=0
+  for n in $(model_names); do
+    load_model "$n"
+    [[ $ENABLED == 1 ]] || continue
+    cmd+="socat TCP-LISTEN:$PORT,fork,reuseaddr UNIX-CONNECT:/socks/$n.sock & "
+    any=1
+  done
+  if (( ! any )); then stop_ctr "$CT_RELAY"; return 0; fi
+  cmd+="wait"
+  harden "$RELAY_MEMORY" 256
+  split_args "$RELAY_PODMAN_ARGS"
+  podman run -d --replace --name "$CT_RELAY" \
+    --user "$SERVICE_UID:$SERVICE_UID" \
+    --network "$NET_BACK" \
+    -v "$SOCK_DIR:/socks:ro" \
+    "${HARDEN[@]}" "${SPLIT[@]}" \
+    --entrypoint /bin/sh "$RELAY_IMAGE" -c "$cmd" >/dev/null
+  ok "relais llama démarré"
+}
+
+start_llama_one() {
+  local n=$1 ex=() args sock
+  load_model "$n"
+  if [[ ! -f $MODELS_DIR/$n/$FILE ]]; then warn "fichier GGUF absent pour '$n' — ignoré"; return 0; fi
+  if [[ -n $EXTRA ]]; then read -r -a ex <<<"$EXTRA"; fi   # pas d'eval : découpage sur les espaces
+  sock=$SOCK_DIR/$n.sock
+  rm -f "$sock"
+  args=(-m "$MODELS_DIR/$n/$FILE" --host "$sock" -c "$CTX"
+        -ngl "${NGL:-$(default_ngl)}" --alias "$n" --jinja "${ex[@]}")
+  info "Démarrage de llama-server : $n (socket $sock)"
+  spawn "llama-$n" "$DATA_DIR" "$BIN_DIR/llama-server" "${args[@]}"
+  wait_sock "$sock" 300 "llama-$n"
+}
+start_llama() {
+  [[ -x $BIN_DIR/llama-server ]] || die "llama-server absent — lance : $PROG install"
+  local n any=0
+  for n in $(model_names); do
+    load_model "$n"
+    [[ $ENABLED == 1 ]] || continue
+    any=1
+    start_llama_one "$n"
+  done
+  if (( any )); then start_relay; else warn "aucun modèle activé — $PROG model setup <nom> <repo-HF> [quant]"; fi
+}
+stop_llama() {
+  local f
+  for f in "$RUN_DIR"/llama-*.pid; do f=${f##*/}; stop_proc "${f%.pid}"; done
+  stop_ctr "$CT_RELAY"
+  rm -f "$SOCK_DIR"/*.sock
+}
+
+litellm_callbacks_file() {
+  local f
+  for f in "$CONF_DIR/custom_callbacks.py" "$DATA_DIR/custom_callbacks.py"; do
+    if [[ -f $f ]]; then echo "$f"; return 0; fi
+  done
+  return 0
+}
+
+gen_litellm_config() {
+  local f=$LITELLM_RT/config.yaml n frag body='' cb
+  cb=$(litellm_callbacks_file)
+  [[ -n $cb ]] || warn "custom_callbacks.py introuvable dans $CONF_DIR : callback désactivé"
+  mkdir -p "$LITELLM_RT"
+  for n in $(model_names); do
+    load_model "$n"
+    [[ $ENABLED == 1 ]] || continue
+    body+=$(cat <<EOF
+  - model_name: $n
+    litellm_params:
+      model: openai/$n
+      api_base: http://$CT_RELAY:$PORT/v1
+      api_key: none
+EOF
+)$'\n'
+  done
+  for frag in "$CONF_DIR"/litellm.d/*.yaml; do
+    body+="  # --- ${frag##*/}"$'\n'"$(cat "$frag")"$'\n'
+  done
+  {
+    echo "# Généré par $PROG à chaque démarrage — ne pas éditer."
+    echo "# Modèles distants : ajoute des éléments de liste dans $CONF_DIR/litellm.d/*.yaml"
+    echo "# (indentés de 2 espaces, ex. '  - model_name: gpt\\n    litellm_params: {...}')"
+    if [[ -n $body ]]; then echo "model_list:"; printf '%s' "$body"; else echo "model_list: []"; fi
+    cat <<EOF
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+litellm_settings:
+  drop_params: false
+  telemetry: false
+EOF
+    if [[ -n $cb ]]; then echo "  callbacks: custom_callbacks.proxy_handler_instance"; fi
+  } >"$f"
+  chmod 644 "$f"
+}
+
+start_litellm() {
+  need_podman; ensure_networks
+  if ctr_running "$CT_LITELLM"; then ok "litellm déjà actif"; return 0; fi
+  ctr_running "$CT_RELAY" || start_relay
+  gen_litellm_config
+  local cb mnt=() nets=(--network "$NET_BACK")
+  cb=$(litellm_callbacks_file)
+  mnt+=(-v "$LITELLM_RT/config.yaml:/etc/litellm/config.yaml:ro")
+  if [[ -n $cb ]]; then mnt+=(-v "$cb:/etc/litellm/custom_callbacks.py:ro"); fi
+  if [[ $LITELLM_PUBLISH == 1 ]]; then nets+=(--network "$NET_FRONT" -p "$BIND_HOST:$LITELLM_PORT:4000"); fi
+  mk_envfile "LITELLM_MASTER_KEY=$LITELLM_MASTER_KEY" LITELLM_MODE=PRODUCTION \
+    LITELLM_LOCAL_MODEL_COST_MAP=True LITELLM_TELEMETRY=False \
+    HOME=/tmp XDG_CACHE_HOME=/tmp/.cache PYTHONDONTWRITEBYTECODE=1 \
+    LITELLM_NON_ROOT=true DISABLE_ADMIN_UI=True \
+    LITELLM_UI_PATH=/tmp/litellm/ui LITELLM_ASSETS_PATH=/tmp/litellm/assets \
+    LITELLM_MIGRATION_DIR=/tmp/litellm/migrations
+  harden "$LITELLM_MEMORY" "$LITELLM_PIDS"
+  split_args "$LITELLM_PODMAN_ARGS"
+  info "Démarrage de LiteLLM"
+  podman run -d --replace --name "$CT_LITELLM" \
+    --user "$SERVICE_UID:$SERVICE_UID" \
+    "${nets[@]}" --env-file "$ENVF" "${mnt[@]}" \
+    "${HARDEN[@]}" "${SPLIT[@]}" \
+    "$LITELLM_IMAGE" --config /etc/litellm/config.yaml --host 0.0.0.0 --port 4000 >/dev/null
+  cleanup_envfile
+  wait_ctr "$CT_LITELLM" 90 litellm "http://127.0.0.1:4000/health/liveliness"
+}
+stop_litellm() { stop_ctr "$CT_LITELLM"; }
+
+start_webui() {
+  need_podman; ensure_networks
+  if ctr_running "$CT_WEBUI"; then ok "open-webui déjà actif"; return 0; fi
+  mkdir -p "$DATA_DIR/webui/home"
+  own_dir "$DATA_DIR/webui" "$SERVICE_UID" "$SERVICE_UID"
+  local env=(
+    "WEBUI_SECRET_KEY=$WEBUI_SECRET_KEY"
+    "OPENAI_API_BASE_URL=http://$CT_LITELLM:4000/v1" "OPENAI_API_KEY=$LITELLM_MASTER_KEY"
+    ENABLE_OLLAMA_API=False USER_AGENT=llmstack "ENABLE_SIGNUP=$WEBUI_ENABLE_SIGNUP"
+    SCARF_NO_ANALYTICS=true DO_NOT_TRACK=true ANONYMIZED_TELEMETRY=false
+    HOME=/app/backend/data/home
+  )
+  if svc_enabled searxng; then
+    env+=(
+      ENABLE_WEB_SEARCH=True WEB_SEARCH_ENGINE=searxng
+      ENABLE_RAG_WEB_SEARCH=True RAG_WEB_SEARCH_ENGINE=searxng
+      "SEARXNG_QUERY_URL=http://$SEARXNG_CONTAINER:8080/search?q=<query>"
+      RAG_WEB_SEARCH_RESULT_COUNT=5 RAG_WEB_SEARCH_CONCURRENT_REQUESTS=3
+    )
+  fi
+  mk_envfile "${env[@]}"
+  harden "$WEBUI_MEMORY" "$WEBUI_PIDS"
+  split_args "$WEBUI_PODMAN_ARGS"
+  info "Démarrage d'Open WebUI (le premier lancement peut être long)"
+  podman run -d --replace --name "$CT_WEBUI" \
+    --user "$SERVICE_UID:$SERVICE_UID" \
+    --network "$NET_BACK" --network "$NET_FRONT" \
+    -p "$BIND_HOST:$WEBUI_PORT:8080" \
+    --env-file "$ENVF" \
+    -v "$DATA_DIR/webui:/app/backend/data" \
+    "${HARDEN[@]}" "${SPLIT[@]}" \
+    "$WEBUI_IMAGE" >/dev/null
+  cleanup_envfile
+  wait_ctr "$CT_WEBUI" 240 open-webui "http://127.0.0.1:8080/health"
+}
+stop_webui() { stop_ctr "$CT_WEBUI"; }
+
+any_running() {
+  local f c
+  for f in "$RUN_DIR"/*.pid; do f=${f##*/}; is_running "${f%.pid}" && return 0; done
+  command -v podman >/dev/null 2>&1 || return 1
+  for c in "$SEARXNG_CONTAINER" "$CT_LITELLM" "$CT_WEBUI" "$CT_RELAY"; do
+    if ctr_running "$c"; then return 0; fi
+  done
+  return 1
+}
+
+# Résolution des cibles (ordre canonique, désactivés exclus)
+TARGETS=()
+resolve_targets() {
+  local a s want=" ${*:-all} "
+  for a in "$@"; do
+    [[ $a == all ]] || [[ " ${SERVICES[*]} " == *" $a "* ]] || die "service inconnu : $a (${SERVICES[*]} | all)"
+  done
+  TARGETS=()
+  for s in "${SERVICES[@]}"; do
+    svc_enabled "$s" || continue
+    if [[ $want == *" all "* || $want == *" $s "* ]]; then TARGETS+=("$s"); fi
+  done
+}
+
+start_services() {
+  local s; resolve_targets "$@"
+  for s in "${TARGETS[@]}"; do "start_$s"; done
+}
+stop_services() {
+  local i; resolve_targets "$@"
+  for (( i = ${#TARGETS[@]} - 1; i >= 0; i-- )); do "stop_${TARGETS[i]}"; done
+}
+
+print_endpoints() {
+  echo
+  echo "  Open WebUI : http://$BIND_HOST:$WEBUI_PORT"
+  if [[ $LITELLM_PUBLISH == 1 ]]; then
+    echo "  API OpenAI : http://$BIND_HOST:$LITELLM_PORT/v1   (clé : $CONF_DIR/secrets.env)"
+  else
+    echo "  API OpenAI : non publiée (LITELLM_PUBLISH=0) — joignable par les conteneurs : http://$CT_LITELLM:4000/v1"
+  fi
+  if svc_enabled searxng; then echo "  SearXNG    : http://127.0.0.1:$SEARXNG_PORT"; fi
+}
+
+cmd_start()   { load_all; start_services "$@"; print_endpoints; }
+cmd_stop()    { load_all; stop_services "$@"; }
+cmd_restart() { load_all; stop_services "$@"; start_services "$@"; print_endpoints; }
+
+cmd_status() {
+  load_all
+  local fmt='%-22s %-8s %-8s %-11s %s\n' n pid h
+  row() { # label pid santé url
+    local st=stoppé
+    if [[ -n $2 ]]; then st=actif; fi
+    printf "$fmt" "$1" "$st" "${2:--}" "$3" "$4"
+  }
+  ctr_health() { # conteneur url
+    if [[ -z $(ctr_pid "$1") ]]; then echo -; elif ctr_http_ok "$1" "$2"; then echo ok; else echo démarrage; fi
+  }
+  printf "$fmt" SERVICE ÉTAT PID SANTÉ URL
+  if command -v podman >/dev/null 2>&1; then
+    if svc_enabled searxng; then
+      pid=$(ctr_pid "$SEARXNG_CONTAINER")
+      row searxng "$pid" "$(ctr_health "$SEARXNG_CONTAINER" http://127.0.0.1:8080/healthz)" "http://127.0.0.1:$SEARXNG_PORT"
+    fi
+  fi
+  for n in $(model_names); do
+    load_model "$n"
+    [[ $ENABLED == 1 ]] || continue
+    pid=$(pid_of "llama-$n"); h=-
+    if [[ -n $pid ]]; then
+      if curl -fsS -o /dev/null --max-time 2 --unix-socket "$SOCK_DIR/$n.sock" http://localhost/health 2>/dev/null; then h=ok; else h=démarrage; fi
+    fi
+    row "llama:$n" "$pid" "$h" "unix:$SOCK_DIR/$n.sock"
+  done
+  if command -v podman >/dev/null 2>&1; then
+    row relay   "$(ctr_pid "$CT_RELAY")" - "$CT_RELAY (réseau interne)"
+    pid=$(ctr_pid "$CT_LITELLM")
+    row litellm "$pid" "$(ctr_health "$CT_LITELLM" http://127.0.0.1:4000/health/liveliness)" "http://$BIND_HOST:$LITELLM_PORT/v1"
+    pid=$(ctr_pid "$CT_WEBUI")
+    row webui   "$pid" "$(ctr_health "$CT_WEBUI" http://127.0.0.1:8080/health)" "http://$BIND_HOST:$WEBUI_PORT"
+  fi
+  echo
+  printf 'llama.cpp %s (%s)\n' "$(cat "$DATA_DIR/llama.rev" 2>/dev/null || echo '-')" "$(cat "$DATA_DIR/backend" 2>/dev/null || echo '-')"
+  printf 'images   : litellm=%s\n           webui=%s\n           searxng=%s\n           relay=%s\n' \
+    "$LITELLM_IMAGE" "$WEBUI_IMAGE" "$SEARXNG_IMAGE" "$RELAY_IMAGE"
+}
+
+cmd_logs() {
+  load_all
+  local t=${1:?usage : $PROG logs <searxng|litellm|webui|relay|nom-de-modèle> [-f]} f ctr=''
+  case $t in
+    searxng) ctr=$SEARXNG_CONTAINER;;
+    litellm) ctr=$CT_LITELLM;;
+    webui)   ctr=$CT_WEBUI;;
+    relay)   ctr=$CT_RELAY;;
+  esac
+  if [[ -n $ctr ]]; then
+    need_podman
+    if [[ ${2:-} == -f ]]; then podman logs -f "$ctr"; else podman logs --tail 100 "$ctr"; fi
+    return
+  fi
+  f=$LOG_DIR/$t.log
+  [[ -f $f ]] || f=$LOG_DIR/llama-$t.log
+  [[ -f $f ]] || die "pas de log pour '$t'"
+  if [[ ${2:-} == -f ]]; then tail -n 100 -f "$f"; else tail -n 100 "$f"; fi
+}
+
+cmd_paths() {
+  load_all
+  printf 'config : %s\ndonnées: %s\nmodèles: %s\nétat   : %s\ncache  : %s\nsockets: %s\n' \
+    "$CONF_DIR" "$DATA_DIR" "$MODELS_DIR" "$STATE_DIR" "$CACHE_DIR" "$SOCK_DIR"
+}
+
+# ───────────────────────────── Sandbox opencode ─────────────────────────────
+# opencode tourne dans un conteneur durci qui ne voit que le projet (+ son dossier d'état).
+# Réseau : interne uniquement (il ne joint que LiteLLM) ; --net ajoute l'accès Internet.
+# uid    : keep-id (défaut, fichiers du projet à ton nom) ou isolated (subuid, tu gères les droits).
+code_build() { # [fresh]
+  need_podman
+  local ctx=$CACHE_DIR/code-build nc=()
+  if [[ ${1:-} == fresh ]]; then nc=(--no-cache); fi
+  [[ $OPENCODE_VERSION != latest ]] || warn "OPENCODE_VERSION=latest : épingle une version dans stack.env"
+  warn_unpinned "$CODE_BASE_IMAGE"
+  mkdir -p "$ctx"
+  cat >"$ctx/Containerfile" <<'EOF'
+ARG BASE=docker.io/library/node:22-bookworm-slim
+FROM ${BASE}
+ARG OPENCODE_VERSION=latest
+ARG APT_PKGS=""
+ARG CODE_UID=60000
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ripgrep curl ca-certificates ${APT_PKGS} \
+ && rm -rf /var/lib/apt/lists/*
+RUN npm install -g "opencode-ai@${OPENCODE_VERSION}" && npm cache clean --force
+RUN groupadd -g "${CODE_UID}" agent && useradd -u "${CODE_UID}" -g "${CODE_UID}" -d /home/agent -s /bin/bash agent
+EOF
+  info "Construction de l'image $CODE_IMAGE"
+  podman build --pull=newer "${nc[@]}" -t "$CODE_IMAGE" \
+    --build-arg "BASE=$CODE_BASE_IMAGE" \
+    --build-arg "OPENCODE_VERSION=$OPENCODE_VERSION" \
+    --build-arg "APT_PKGS=$CODE_APT_PKGS" \
+    --build-arg "CODE_UID=$CODE_UID" \
+    -f "$ctx/Containerfile" "$ctx"
+  ok "image prête : $CODE_IMAGE"
+}
+
+code_check_dir() { # refuse de monter un répertoire sensible (ou parent d'un répertoire sensible)
+  local p=$1 d
+  [[ $p != / && $p != "$HOME" ]] || die "refus de monter '$p' : choisis un répertoire de projet"
+  for d in "$CONF_DIR" "$DATA_DIR" "$STATE_DIR" "$SOCK_DIR" "$HOME/.ssh" "$HOME/.gnupg" "$HOME/.aws"; do
+    if [[ $p/ == "$d"/* || $d/ == "$p"/* ]]; then die "refus de monter '$p' (contient ou est dans $d)"; fi
+  done
+}
+
+# Génère la config opencode (ou utilise $CONF_DIR/opencode.json) ; montée en lecture seule
+CODE_CONF=''
+code_write_config() {
+  local f=$STATE_DIR/code/opencode.json n first='' sep='' models='' out
+  mkdir -p "${f%/*}"
+  CODE_CONF=$f
+  if [[ -f $CONF_DIR/opencode.json ]]; then CODE_CONF=$CONF_DIR/opencode.json; return 0; fi
+  for n in $(model_names); do
+    load_model "$n"
+    [[ $ENABLED == 1 ]] || continue
+    [[ -n $first ]] || first=$n
+    out=$(( CTX / 4 ))
+    if (( out > 16384 )); then out=16384; fi
+    models+="$sep"$'\n'"        \"$n\": { \"name\": \"$n\", \"limit\": { \"context\": $CTX, \"output\": $out } }"
+    sep=,
+  done
+  [[ -n $first ]] || die "aucun modèle activé — $PROG model setup <nom> <repo-HF> [quant]"
+  cat >"$f" <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "share": "disabled",
+  "autoupdate": false,
+  "model": "llmstack/$first",
+  "provider": {
+    "llmstack": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "llmstack",
+      "options": {
+        "baseURL": "http://$CT_LITELLM:4000/v1",
+        "apiKey": "{env:LLMSTACK_API_KEY}"
+      },
+      "models": {$models
+      }
+    }
+  }
+}
+EOF
+  chmod 644 "$f"
+}
+
+cmd_code() { # [--net] [--isolated] [build|shell|reset] [dir] [-- args opencode]
+  load_all
+  need_podman
+  local want_net=$CODE_NET userns=$CODE_USERNS sub=run
+  while (( $# )); do
+    case $1 in
+      --net)      want_net=1; shift;;
+      --offline)  want_net=0; shift;;
+      --isolated) userns=isolated; shift;;
+      --keep-id)  userns=keep-id; shift;;
+      *) break;;
+    esac
+  done
+  case ${1:-} in build|shell|reset) sub=$1; shift;; esac
+  case $sub in
+    build) code_build fresh; return 0;;
+    reset) confirm "Effacer l'état d'opencode (sessions, auth) ?" || return 0
+           safe_rm_ns "$CODE_HOME" "$CODE_HOME_ISO"; mkdir -p "$CODE_HOME"; ok "état d'opencode effacé"; return 0;;
+  esac
+
+  local dir=$PWD proj oc=() ocmd=(opencode)
+  if (( $# )) && [[ $1 != -* && -d $1 ]]; then dir=$1; shift; fi
+  if [[ ${1:-} == -- ]]; then shift; fi
+  oc=("$@")
+  if [[ $sub == shell ]]; then ocmd=(bash); fi
+  proj=$(realpath -- "$dir")
+  code_check_dir "$proj"
+
+  ensure_networks
+  podman image exists "$CODE_IMAGE" || code_build
+  if ! ctr_running "$CT_LITELLM"; then
+    info "LiteLLM est arrêté : démarrage de llama + litellm"
+    start_services llama litellm
+  fi
+  code_write_config
+
+  local uopt=() home nopt=(--network "$NET_BACK") mnt=()
+  case $userns in
+    keep-id)
+      uopt=(--userns="keep-id:uid=$CODE_UID,gid=$CODE_UID"); home=$CODE_HOME;;
+    isolated)
+      uopt=(--user "$CODE_UID:$CODE_UID"); home=$CODE_HOME_ISO
+      own_dir "$home" "$CODE_UID" "$CODE_UID"
+      info "mode isolé : le projet doit être accessible à l'uid conteneur $CODE_UID (ex: podman unshare chown -R $CODE_UID:$CODE_UID '$proj')";;
+    *) die "CODE_USERNS inconnu : $userns (keep-id|isolated)";;
+  esac
+  if [[ $want_net == 1 ]]; then nopt+=(--network "$NET_FRONT"); fi
+
+  # Points d'entrée d'exécution côté hôte en lecture seule : hooks et config git
+  if [[ -d $proj/.git/hooks ]]; then mnt+=(-v "$proj/.git/hooks:/work/.git/hooks:ro"); fi
+  if [[ -f $proj/.git/config ]]; then mnt+=(-v "$proj/.git/config:/work/.git/config:ro"); fi
+
+  mk_envfile "LLMSTACK_API_KEY=${CODE_API_KEY:-$LITELLM_MASTER_KEY}" OPENCODE_CONFIG=/etc/opencode.json HOME=/home/agent
+  harden "$CODE_MEMORY" "$CODE_PIDS"
+  split_args "$CODE_PODMAN_ARGS"
+
+  info "opencode (sandbox, $userns, réseau $([[ $want_net == 1 ]] && echo 'interne + Internet' || echo interne)) sur $proj"
+  local rc=0
+  podman run --rm -it \
+    "${uopt[@]}" "${nopt[@]}" \
+    --env-file "$ENVF" -e TERM -e COLORTERM \
+    -v "$home:/home/agent" \
+    -v "$CODE_CONF:/etc/opencode.json:ro" \
+    -v "$proj:/work" -w /work \
+    "${mnt[@]}" \
+    "${HARDEN[@]}" "${SPLIT[@]}" \
+    "$CODE_IMAGE" "${ocmd[@]}" "${oc[@]}" || rc=$?
+  cleanup_envfile
+  return "$rc"
+}
+
+usage() {
+  cat <<EOF
+$PROG $VERSION — pile LLM locale (llama.cpp · LiteLLM · Open WebUI · SearXNG · opencode)
+
+Usage : $PROG [-y] <commande> [args]
+
+  install [--backend auto|cuda|hip|vulkan|metal|cpu] [--ref <tag|branche>] [--no-searxng]
+  update  [llama|litellm|webui|searxng|relay|code ...]   met à jour (pull des images épinglées ;
+                                              redémarre si la stack tournait ; défaut : sans code)
+  start   [searxng|llama|litellm|webui ...]   (défaut : tout)
+  stop    [...]
+  restart [...]
+  status
+  logs    <searxng|litellm|webui|relay|modèle> [-f]
+  uninstall [--purge]                         --purge : supprime aussi modèles, données et config
+  paths                                       affiche les répertoires utilisés
+
+  code    [--net] [--isolated] [dir] [-- args opencode]
+                                              opencode en sandbox sur dir (défaut : .)
+                                              --net : accès Internet · --isolated : uid sans lien avec le tien
+  code build | shell [dir] | reset            image · shell dans le sandbox · efface l'état d'opencode
+
+  model setup <nom> <user/repo[:quant] | fichier.gguf> [quant|fichier]
+              [--ctx N] [--ngl N] [--extra "args llama-server"] [--port N] [--no-enable]
+  model list                                  modèles installés (alias : models)
+  model files <user/repo>                     liste les GGUF disponibles sur Hugging Face
+  model enable|disable <nom>
+  model remove <nom>
+
+Options globales : -y|--yes (pas de confirmation)    Variable : HF_TOKEN (dépôts privés)
+Surcharges : \${XDG_CONFIG_HOME:-~/.config}/llmstack/stack.env
+EOF
+}
+
+main() {
+  local args=() a
+  for a in "$@"; do
+    case $a in -y|--yes) ASSUME_YES=1;; *) args+=("$a");; esac
+  done
+  set -- "${args[@]}"
+  local cmd=${1:-help}; shift || true
+  case $cmd in
+    install)   cmd_install "$@";;
+    update|upgrade) cmd_update "$@";;
+    start)     cmd_start "$@";;
+    stop)      cmd_stop "$@";;
+    restart)   cmd_restart "$@";;
+    status)    cmd_status;;
+    logs)      cmd_logs "$@";;
+    uninstall) cmd_uninstall "$@";;
+    model)     cmd_model "$@";;
+    models)    cmd_model list;;
+    paths)     cmd_paths;;
+    code)      cmd_code "$@";;
+    -V|--version) echo "$VERSION";;
+    help|-h|--help) usage;;
+    *) usage >&2; exit 1;;
+  esac
+}
+
+main "$@"
